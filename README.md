@@ -1,8 +1,8 @@
 # free-model-aggregator-02
 
-[![make.fun bounty](https://img.shields.io/badge/make.fun-bounty-blue)](https://make.fun/bounty/free-model-aggregator-02)
-[![Prize $500](https://img.shields.io/badge/prize-%24500-green)](https://make.fun/bounty/free-model-aggregator-02)
-[![Status open](https://img.shields.io/badge/status-open-orange)](https://make.fun/bounty/free-model-aggregator-02)
+[![make.fun bounty](https://make.fun/badge/free-model-aggregator-02.svg)](https://make.fun/bounty/free-model-aggregator-02)
+[![rank](https://make.fun/badge/free-model-aggregator-02/0xPaasepp/makefun-free-model-aggregator-02/rank.svg)](https://make.fun/bounty/free-model-aggregator-02)
+[![reward](https://make.fun/badge/free-model-aggregator-02/0xPaasepp/makefun-free-model-aggregator-02/reward.svg)](https://make.fun/bounty/free-model-aggregator-02)
 
 One server that serves the OpenAI Chat Completions API and the Anthropic
 Messages API — in JSON and in server-sent events — and answers every
