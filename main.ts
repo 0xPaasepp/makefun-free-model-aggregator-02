@@ -46,7 +46,7 @@ const POLL_INTERVAL_MS = 100;
 /** How long one gateway call may take before it counts as a refusal. */
 const DIAL_TIMEOUT_MS = 28000;
 /** The most gateway calls one prompt may cost, refusals included. */
-const MAX_ATTEMPTS_PER_PROMPT = 4;
+const MAX_ATTEMPTS_PER_PROMPT = 6;
 /** The most bytes of one client request body this server reads. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** The output cap a request gets when it names none; the gateway refuses uncapped calls. */
@@ -61,11 +61,10 @@ const FIXED_CREATED_AT = '2026-01-01T00:00:00Z';
 const REUSE_PENALTY_FIRST = 60;
 /** The extra penalty, in rating milli, for each further call on a model. */
 const REUSE_PENALTY_PER_CALL = 10;
-/** The penalty, in rating milli, for each refusal a model has already given this trial. Small enough
- * that a refused model is retried after one intervening prompt -- a failed retry costs only a
- * tie-break call, while a recovered model regains its full rating -- and large enough that the next
- * prompt after a refusal spreads to a fresh model instead of hammering the same one. */
-const REFUSED_PENALTY = 150;
+/** Each refusal costs 40 rating milli: one transient refusal cannot demote the best below the worst. */
+const REFUSED_PENALTY = 40;
+/** Plain Chat Completions returns 403: this model is only available on agentic harnesses. */
+const ROUTING_EXCLUDED_MODEL = 'openrouter/thinkingmachines/inkling-2-small:free';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -365,13 +364,13 @@ function reusePenalty(calls: number): number {
 /**
  * The free models that meet one prompt's requirements, in the order to try them: the rating lost
  * against this prompt's best model, plus the reuse penalty for the calls already spent on that model,
- * plus a heavy penalty for each refusal it has already given. A fresh near-best model therefore beats
- * a tired best one, and a model that refused once sits at the back of the line for the rest of the
+ * plus a modest penalty for each refusal it has already given. A fresh near-best model therefore beats
+ * a tired best one, while a transient refusal leaves the best model competitive later in the
  * trial. Ties break by rating, then by id, so the order is a pure function of the brief and the
  * gateway's answers so far.
  */
 function orderedCandidates(requires: Requirement): ModelRow[] {
-  const eligible = freeModels(brief).filter((m) => meetsRequirements(requires, capabilitiesOf(m)));
+  const eligible = freeModels(brief).filter((m) => m.id !== ROUTING_EXCLUDED_MODEL && meetsRequirements(requires, capabilitiesOf(m)));
   let bestRating = 0;
   for (const m of eligible) if (m.rating_milli > bestRating) bestRating = m.rating_milli;
   const scored = eligible.map((model) => {
@@ -623,6 +622,11 @@ async function serve(
   const stream = body.stream === true;
   const requires = requirementsFor(index, body);
   const token = tokenOfRequest(api, body);
+  const declaredTools = new Set((Array.isArray(body.tools) ? body.tools : []).flatMap((tool) => {
+    if (!isRecord(tool)) return [];
+    const name = api === 'anthropic' ? tool.name : isRecord(tool.function) ? tool.function.name : undefined;
+    return typeof name === 'string' ? [name] : [];
+  }));
   const candidates = orderedCandidates(requires);
   const failures: Failure[] = [];
   let fallback: { model: string; answer: UpstreamAnswer } | null = null;
@@ -653,14 +657,15 @@ async function serve(
       log(`${model.id} refused HTTP ${res.status} for prompt ${index + 1}`);
       continue;
     }
-    const answer = parseUpstream(res.text, stream);
+    const parsed = parseUpstream(res.text, stream);
+    const answer = parsed === null ? null : stripUndeclaredTools(parsed, declaredTools);
     if (answer === null) {
       failures.push({ status: res.status, code: 'unparseable_answer', model: model.id });
       state.refusals += 1;
       log(`${model.id} answered 2xx with an unreadable body for prompt ${index + 1}`);
       continue;
     }
-    if (token !== null && !answer.text.includes(token)) {
+    if ((answer.text === '' && !hasToolCalls(answer)) || (token !== null && !answer.text.includes(token))) {
       // The answer is real but carries no token, so it earns this prompt nothing on quality: keep it
       // as the fallback and try the next candidate for one that echoes the token.
       if (fallback === null) fallback = { model: model.id, answer };
@@ -668,11 +673,11 @@ async function serve(
       continue;
     }
     log(`${model.id} answered prompt ${index + 1}`);
-    return buildClientResponse(api, model.id, answer, stream, failures);
+    return buildClientResponse(api, model.id, answer, stream, failures, declaredTools);
   }
   if (fallback !== null) {
     log(`${fallback.model} is the fallback for prompt ${index + 1}: no candidate echoed its token`);
-    return buildClientResponse(api, fallback.model, fallback.answer, stream, failures);
+    return buildClientResponse(api, fallback.model, fallback.answer, stream, failures, declaredTools);
   }
   return { status: 502, failures, json: errorBody(api, 502, 'upstream_error', 'no free model could serve this request') };
 }
@@ -840,8 +845,80 @@ function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
+/** Deterministic fallback: four answer characters per output token, rounded up. */
+function answerUsage(usage: unknown, text: string): Json {
+  const source = isRecord(usage) ? usage : {};
+  if (numberOrZero(source.completion_tokens) > 0) return source;
+  const input = numberOrZero(source.prompt_tokens);
+  const output = Math.ceil(text.length / 4);
+  return { ...source, prompt_tokens: input, completion_tokens: output, total_tokens: input + output };
+}
+
+/** Drop undeclared calls before token checks and either wire's answer translation. */
+function stripUndeclaredTools(answer: UpstreamAnswer, declaredTools: ReadonlySet<string>): UpstreamAnswer {
+  const allowedIndexes = new Set<number>();
+  const filterBody = (body: Json, streamed: boolean): Json => {
+    const choices = Array.isArray(body.choices) ? body.choices : [];
+    return { ...body, choices: choices.map((choice) => {
+      if (!isRecord(choice)) return choice;
+      const key = streamed ? 'delta' : 'message';
+      const message = isRecord(choice[key]) ? choice[key] : {};
+      const filtered: Json = { ...message };
+      if (Array.isArray(message.content)) {
+        filtered.content = message.content.filter((block) =>
+          !isRecord(block) || block.type !== 'tool_use' || declaredTools.has(stringOf(block.name)));
+      }
+      if (Array.isArray(message.tool_calls)) {
+        filtered.tool_calls = message.tool_calls.filter((call) => {
+          if (!isRecord(call)) return false;
+          const fn = isRecord(call.function) ? call.function : {};
+          const index = numberOrZero(call.index);
+          if (!streamed) return declaredTools.has(stringOf(fn.name));
+          if (typeof fn.name === 'string') {
+            if (declaredTools.has(fn.name)) allowedIndexes.add(index);
+            else allowedIndexes.delete(index);
+          }
+          return allowedIndexes.has(index);
+        });
+      }
+      return { ...choice, [key]: filtered };
+    }) };
+  };
+  if (answer.json !== null) {
+    const json = filterBody(answer.json, false);
+    return { ...answer, json, text: jsonAnswerText(json) };
+  }
+  const frames = (answer.frames ?? []).map((frame) => {
+    try {
+      const chunk: unknown = JSON.parse(frame.data);
+      return isRecord(chunk) ? { ...frame, data: JSON.stringify(filterBody(chunk, true)) } : frame;
+    } catch {
+      return frame;
+    }
+  });
+  return { ...answer, frames, text: streamAnswerText(frames) };
+}
+
+/** Whether a sanitized answer retains any declared tool call. */
+function hasToolCalls(answer: UpstreamAnswer): boolean {
+  const bodies: Json[] = answer.json !== null ? [answer.json] : (answer.frames ?? []).flatMap((frame) => {
+    try {
+      const chunk: unknown = JSON.parse(frame.data);
+      return isRecord(chunk) ? [chunk] : [];
+    } catch {
+      return [];
+    }
+  });
+  return bodies.some((body) => (Array.isArray(body.choices) ? body.choices : []).some((choice) => {
+    if (!isRecord(choice)) return false;
+    const message = isRecord(choice.message) ? choice.message : isRecord(choice.delta) ? choice.delta : {};
+    return (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) ||
+      (Array.isArray(message.content) && message.content.some((block) => isRecord(block) && block.type === 'tool_use'));
+  }));
+}
+
 /** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. */
-function openAIToAnthropic(body: Json, model: string): Json {
+function openAIToAnthropic(body: Json, model: string, declaredTools: ReadonlySet<string>): Json {
   const choices = Array.isArray(body.choices) ? body.choices : [];
   const choice = isRecord(choices[0]) ? choices[0] : {};
   const message = isRecord(choice.message) ? choice.message : {};
@@ -850,7 +927,7 @@ function openAIToAnthropic(body: Json, model: string): Json {
   if (text !== '') content.push({ type: 'text', text });
   const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   for (const call of calls) {
-    if (!isRecord(call) || !isRecord(call.function)) continue;
+    if (!isRecord(call) || !isRecord(call.function) || !declaredTools.has(stringOf(call.function.name))) continue;
     content.push({
       type: 'tool_use',
       id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
@@ -859,7 +936,7 @@ function openAIToAnthropic(body: Json, model: string): Json {
     });
   }
   if (content.length === 0) content.push({ type: 'text', text: '' });
-  const usage = isRecord(body.usage) ? body.usage : {};
+  const usage = answerUsage(body.usage, text);
   return {
     id: `msg_${typeof body.id === 'string' ? body.id : 'aggregate'}`,
     type: 'message',
@@ -929,7 +1006,7 @@ function openAIStreamRelay(frames: SseFrame[], model: string): string {
  * stop reason is held until the stream's usage chunk has arrived: OpenAI sends the usage after the
  * finish_reason, and Anthropic's message_delta carries the output tokens.
  */
-function anthropicStreamRelay(frames: SseFrame[], model: string): string {
+function anthropicStreamRelay(frames: SseFrame[], model: string, declaredTools: ReadonlySet<string>): string {
   let out = '';
   let started = false;
   let finished = false;
@@ -939,6 +1016,7 @@ function anthropicStreamRelay(frames: SseFrame[], model: string): string {
   const toolIndexes = new Map<number, number>();
   let inputTokens = 0;
   let outputTokens = 0;
+  let answerText = '';
 
   const startEvents = (): string => {
     if (started) return '';
@@ -970,6 +1048,7 @@ function anthropicStreamRelay(frames: SseFrame[], model: string): string {
   const finishEvents = (stopReason: string): string => {
     if (finished) return '';
     finished = true;
+    if (outputTokens <= 0) outputTokens = numberOrZero(answerUsage(null, answerText).completion_tokens);
     return (
       closeEvents() +
       sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }) +
@@ -999,6 +1078,7 @@ function anthropicStreamRelay(frames: SseFrame[], model: string): string {
     const delta = isRecord(choice.delta) ? choice.delta : {};
     out += startEvents();
     if (typeof delta.content === 'string' && delta.content !== '') {
+      answerText += delta.content;
       if (textIndex === -1) {
         textIndex = nextIndex;
         nextIndex += 1;
@@ -1012,6 +1092,8 @@ function anthropicStreamRelay(frames: SseFrame[], model: string): string {
       const upstreamIndex = typeof call.index === 'number' ? call.index : toolIndexes.size;
       let index = toolIndexes.get(upstreamIndex);
       if (index === undefined) {
+        const fn = isRecord(call.function) ? call.function : {};
+        if (!declaredTools.has(stringOf(fn.name))) continue;
         if (textIndex !== -1) {
           out += sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex });
           textIndex = -1;
@@ -1019,7 +1101,6 @@ function anthropicStreamRelay(frames: SseFrame[], model: string): string {
         index = nextIndex;
         nextIndex += 1;
         toolIndexes.set(upstreamIndex, index);
-        const fn = isRecord(call.function) ? call.function : {};
         out += sseEvent('content_block_start', {
           type: 'content_block_start',
           index,
@@ -1055,14 +1136,15 @@ function buildClientResponse(
   answer: UpstreamAnswer,
   stream: boolean,
   failures: Failure[],
+  declaredTools: ReadonlySet<string>,
 ): { status: number; json?: Json; sse?: string; failures: Failure[] } {
   if (!stream) {
     const json = answer.json ?? {};
-    if (api === 'anthropic') return { status: 200, json: openAIToAnthropic(json, model), failures };
-    return { status: 200, json: { ...json, model }, failures };
+    if (api === 'anthropic') return { status: 200, json: openAIToAnthropic(json, model, declaredTools), failures };
+    return { status: 200, json: { ...json, model, usage: answerUsage(json.usage, answer.text) }, failures };
   }
   const frames = answer.frames ?? [];
-  if (api === 'anthropic') return { status: 200, sse: anthropicStreamRelay(frames, model), failures };
+  if (api === 'anthropic') return { status: 200, sse: anthropicStreamRelay(frames, model, declaredTools), failures };
   return { status: 200, sse: openAIStreamRelay(frames, model), failures };
 }
 
